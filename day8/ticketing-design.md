@@ -197,32 +197,101 @@ Represents seats allocated to orders. The database must also enforce uniqueness 
 
 Relationships
 
-- One user can place many orders.
+- One user can create many orders and seat holds.
 - One event has many seats.
 - One user can create many holds.
 - One hold can contain multiple seats.
 - One order can contain multiple seats through Order Items.
 - Each order belongs to one user.
+- Each order item references a seat for a specific event.
 
 5. Preventing Double-Booking
 
-The database, not the browser, is the final authority on seat availability.
+The database is the final authority on seat availability. Checking availability in the frontend alone is insufficient because two customers can select the same seat at almost exactly the same time.
 
-1. A customer selects seats.
-2. The server begins a database transaction.
-3. It locks the relevant seat records or performs a conditional allocation protected by a unique constraint.
-4. It verifies that all requested seats are available.
-5. It allocates all requested seats together.
-6. If any seat is unavailable, the transaction rolls back.
-7. If every seat is available, the transaction commits the hold with an expiration time.
-8. After successful, verified payment, the order is confirmed and the tickets are issued.
-9. Expired holds are released through a safe transactional process.
+TicketHub uses PostgreSQL transactions, row-level locks, and database constraints to ensure that only one customer can successfully hold a particular seat for an event.
 
-A unique constraint on "(event_id, seat_id)" for active seat allocations prevents two concurrent transactions from successfully claiming the same seat.
+Example transaction using SELECT FOR UPDATE
 
-For example, if Alice and Bob attempt to reserve seat 501 at the same time, the database allows only one allocation to succeed. The other request receives a conflict response and must select another seat.
+The following simplified SQL demonstrates the core reservation logic. Assume "event_seats" contains one row for each seat at each event, with a status such as AVAILABLE, HELD, or SOLD.
 
-Payment processing must also be idempotent. A retry should not create a second order or issue duplicate tickets. Payment-provider calls should not be made while holding a long-running database transaction; instead, the system records and verifies payment outcomes before safely finalizing the booking.
+BEGIN;
+
+-- Lock the requested seat so concurrent transactions
+-- cannot allocate it simultaneously.
+SELECT status
+FROM event_seats
+WHERE event_id = 101
+  AND seat_id = 501
+FOR UPDATE;
+
+-- Application logic checks the returned status.
+-- Continue only if the seat is AVAILABLE.
+
+UPDATE event_seats
+SET status = 'HELD'
+WHERE event_id = 101
+  AND seat_id = 501
+  AND status = 'AVAILABLE';
+
+-- Application checks that exactly one row was updated.
+-- If zero rows were updated, reject the reservation
+-- and roll back the transaction.
+
+INSERT INTO seat_holds (
+    hold_id,
+    user_id,
+    event_id,
+    seat_id,
+    status,
+    expires_at
+)
+VALUES (
+    'hold_123',
+    42,
+    101,
+    501,
+    'HELD',
+    CURRENT_TIMESTAMP + INTERVAL '10 minutes'
+);
+
+COMMIT;
+
+This is illustrative SQL; production code must implement the conditional update, check its affected-row count, and roll back if the seat is unavailable. The hold record and seat status must change atomically.
+
+What happens when two users compete?
+
+Suppose Alice and Bob both request seat 501:
+
+1. Alice's transaction locks the seat row first.
+2. Bob's transaction attempts to lock the same row and must wait.
+3. Alice checks that the seat is AVAILABLE, changes its status to HELD, and commits.
+4. Bob obtains the lock after Alice commits and sees that the seat is no longer AVAILABLE.
+5. Bob's reservation is rejected, and the API returns HTTP 409 Conflict.
+
+If Alice's transaction rolls back instead, Bob can proceed if the seat remains available.
+
+Database constraints
+
+Row locks protect concurrent operations, while database constraints provide an additional layer of protection.
+
+- Use a primary key on "(event_id, seat_id)" in the seat inventory table.
+- Use foreign keys to ensure that reservations reference valid users, events, and seats.
+- Use a unique constraint on "(event_id, seat_id)" in the active seat-allocation table so the same seat cannot have two active allocations.
+- Use a unique idempotency key for order creation to prevent duplicate orders from retried requests.
+
+The database must also handle expired holds safely. A background worker can release expired seats using a transaction that verifies the hold is still active and has not been converted into a confirmed booking.
+
+Payment and ticket confirmation
+
+The system should not keep a database row lock open while waiting for an external payment provider.
+
+Instead, TicketHub creates a time-limited hold, initiates payment, verifies the payment result, and then finalizes the order and ticket allocation through an idempotent workflow.
+
+If payment fails or the hold expires, the system releases the seat safely. If payment succeeds but the application encounters an error, retries and reconciliation must recover the correct booking state without issuing duplicate tickets.
+
+The essential rule is that every successful allocation must pass through the same database-enforced reservation process. Checking availability in the browser or relying on a cached value is never enough.
+
 
 6. Architecture Diagram
 
